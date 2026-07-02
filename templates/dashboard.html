@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AMCOP Interactive C2 Node</title>
+    
+    <!-- React Core Framework Engine -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- Live Babel Compiler for JSX Compiles -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Recharts Dependencies (Prop-Types, Recharts itself) -->
+    <script src="https://unpkg.com/prop-types@15.8.1/prop-types.js"></script>
+    <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+    
+    <!-- UI Framework: Tailwind CSS v4 Engine CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    
+    <style>
+        .cyber-grid { 
+            background-size: 40px 40px; 
+            background-image: linear-gradient(to right, rgba(6, 182, 212, 0.05) 1px, transparent 1px), 
+                              linear-gradient(to bottom, rgba(6, 182, 212, 0.05) 1px, transparent 1px); 
+        }
+        .animate-fade-in { animation: fadeIn 0.4s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-[#030712] text-slate-100 min-h-screen cyber-grid font-mono selection:bg-cyan-500/30">
+
+    <!-- Target mount node for our React UI tree -->
+    <div id="amcop-root"></div>
+
+<script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+    const { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } = Recharts;
+
+    function AmcopDashboard() {
+        const [logs, setLogs] = useState([]);
+        const [metrics, setMetrics] = useState({ total: 0, resilient: 0, vulnerable: 0, catch_rate: 0 });
+        const [selectedTechnique, setSelectedTechnique] = useState("T1087");
+        const [isExecuting, setIsExecuting] = useState(false);
+        
+        // Active selected log index for raw terminal view tracking
+        const [activeLogIndex, setActiveLogIndex] = useState(0);
+
+        useEffect(() => {
+            const eventStream = new EventSource("/stream-telemetry");
+            eventStream.onmessage = (event) => {
+                const updateData = JSON.parse(event.data);
+                setLogs(updateData.logs || []);
+                setMetrics(updateData.metrics || { total: 0, resilient: 0, vulnerable: 0, catch_rate: 0 });
+            };
+            return () => eventStream.close();
+        }, []);
+
+        const chartData = useMemo(() => {
+            if (!logs || logs.length === 0) return [];
+            return [...logs].reverse().map((log, index) => ({
+                name: `C-${index + 1}`,
+                resilient: log.system_resilience === "RESILIENT" ? 100 : 0,
+            }));
+        }, [logs]);
+
+        const triggerAttackCycle = async () => {
+            setIsExecuting(true);
+            try {
+                await fetch(`/execute-simulation/${selectedTechnique}`, { method: 'POST' });
+                // Enforce state refocus on the absolute newest incoming array index
+                setActiveLogIndex(0); 
+            } catch (error) {
+                console.error(error);
+            } finally {
+                // Give a 3.5s window to ensure the backend completely finished logging to Mongo
+                setTimeout(() => {
+                    setIsExecuting(false);
+                    setActiveLogIndex(0); // Double check snapping to the fresh log
+                }, 3500);
+            }
+        };
+
+        const activeLog = logs[activeLogIndex] || null;
+        const radius = 45;
+        const circumference = 2 * Math.PI * radius;
+        const strokeDashoffset = circumference - (metrics.catch_rate / 100) * circumference;
+
+        return (
+            <div className="min-h-screen flex flex-col p-6 space-y-6 max-w-[1700px] w-full mx-auto">
+                {/* Header */}
+                <header className="flex items-center justify-between border-b border-slate-900 pb-4">
+                    <div>
+                        <h1 className="text-xl font-black bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">AMCOP // ADVANCED C2 WAR ROOM</h1>
+                        <p className="text-[10px] text-slate-500 uppercase">Live Multi-Vector Simulation & Defensive Interception Deck</p>
+                    </div>
+                    <span className="border border-cyan-500/30 text-cyan-400 rounded px-3 py-1 text-[10px] uppercase bg-cyan-950/20">SSE DATA LINK STABLE</span>
+                </header>
+
+                {/* Controls Area */}
+                <div className="bg-slate-900/30 border border-slate-800/80 rounded-xl p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+                    <div>
+                        <h2 className="text-xs font-bold uppercase text-cyan-400">Tactical Control Array</h2>
+                        <p className="text-[11px] text-slate-400 mt-0.5">Deploy customized payloads directly from the virtual web pipeline node.</p>
+                    </div>
+                    <div className="flex items-center gap-3 w-full sm:w-auto">
+                        <select value={selectedTechnique} onChange={(e) => setSelectedTechnique(e.target.value)} className="bg-slate-950 border border-slate-800 text-slate-300 font-mono text-xs p-2.5 rounded-lg w-full sm:w-64 focus:outline-none focus:border-cyan-500">
+                            <option value="T1087">T1087 - Account Discovery</option>
+                            <option value="T1049">T1049 - Net Connections Discovery</option>
+                        </select>
+                        <button onClick={triggerAttackCycle} disabled={isExecuting} className={`bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black text-xs uppercase px-6 py-3 tracking-wider transition-all duration-300 rounded-lg ${isExecuting ? 'animate-pulse opacity-50 cursor-not-allowed' : 'hover:scale-[1.02] cursor-pointer hover:shadow-[0_0_15px_rgba(6,182,212,0.4)]'}`}>
+                            {isExecuting ? "CYCLE PROCESSING..." : "Launch Attack Cycle"}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Graphs and Gauges Row */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className="lg:col-span-2 bg-slate-900/10 border border-slate-800/60 rounded-xl p-5 h-[260px] flex flex-col">
+                        <h3 className="text-[10px] text-slate-500 uppercase tracking-widest font-bold mb-4">Cyber Resilience Drift Timeline</h3>
+                        <div className="flex-1 min-h-0 text-xs">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={chartData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" opacity={0.2} />
+                                    <XAxis dataKey="name" stroke="#64748b" tickLine={false} />
+                                    <YAxis stroke="#64748b" tickLine={false} domain={[0, 100]} ticks={[0, 100]} />
+                                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontFamily: 'monospace' }}/>
+                                    <Line type="monotone" dataKey="resilient" stroke="#22d3ee" strokeWidth={3} dot={{ fill: '#0f172a', stroke: '#06b6d4', strokeWidth: 2, r: 4 }} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+                    <div className="bg-slate-900/10 border border-slate-800/60 rounded-xl p-5 flex flex-col items-center justify-center relative">
+                        <h3 className="text-[10px] text-slate-500 uppercase font-bold absolute top-5 left-5">Defensive Containment Matrix</h3>
+                        <div className="relative flex items-center justify-center">
+                            <svg className="w-32 h-32 transform -rotate-90">
+                                <circle cx="64" cy="64" r={radius} className="stroke-slate-800" strokeWidth="8" fill="transparent" />
+                                <circle cx="64" cy="64" r={radius} className="stroke-cyan-400 transition-all duration-1000" strokeWidth="8" fill="transparent" strokeDasharray={circumference} strokeDashoffset={strokeDashoffset} strokeLinecap="round" />
+                            </svg>
+                            <div className="absolute text-center">
+                                <span className="text-2xl font-black text-slate-100">{metrics.catch_rate}%</span>
+                                <div className="text-[8px] text-slate-500 tracking-wider">CATCH RATE</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Main Split Layout: Ledger vs Live Telemetry Console */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    {/* Left: Ledger List */}
+                    <div className="bg-slate-900/10 border border-slate-800/80 rounded-xl overflow-hidden flex flex-col max-h-[400px]">
+                        <div className="px-5 py-3 border-b border-slate-800 bg-slate-900/40 text-xs font-bold text-slate-300 uppercase">Orchestration Ledger</div>
+                        <div className="overflow-y-auto flex-1">
+                            <table className="w-full text-left border-collapse">
+                                <thead>
+                                    <tr className="bg-slate-950/40 border-b border-slate-800 text-slate-500 text-[10px] uppercase">
+                                        <th className="py-3 px-4">Timestamp</th>
+                                        <th className="py-3 px-4">Vector ID</th>
+                                        <th className="py-3 px-4 text-right">Conclusion</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="text-xs divide-y divide-slate-900/40">
+                                    {logs.map((log, idx) => (
+                                        <tr key={idx} onClick={() => setActiveLogIndex(idx)} className={`cursor-pointer border-b border-slate-900/40 transition-colors ${idx === activeLogIndex ? 'bg-cyan-950/20 border-l-2 border-l-cyan-500' : 'hover:bg-slate-900/20'}`}>
+                                            <td className="py-3 px-4 text-slate-400">{log.timestamp.split(" ")[1]}</td>
+                                            <td className="py-3 px-4"><span className="bg-slate-900 text-slate-300 px-2 py-0.5 rounded border border-slate-800 font-mono text-[10px]">{log.mitre_technique}</span></td>
+                                            <td className="py-3 px-4 text-right"><span className={`text-[10px] font-black tracking-wider ${log.system_resilience === 'RESILIENT' ? 'text-emerald-400' : 'text-rose-400'}`}>{log.system_resilience}</span></td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    {/* Right: Dual Analyst Consoles */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 h-[400px]">
+                        {/* Red Agent Raw Console Output */}
+                        <div className="bg-black/80 border border-red-950/60 rounded-xl flex flex-col overflow-hidden p-4 shadow-lg">
+                            <div className="flex items-center gap-2 border-b border-red-950/40 pb-2 mb-2">
+                                <span className="h-2 w-2 rounded-full bg-red-500"></span>
+                                <h4 className="text-[10px] font-bold uppercase text-red-400 tracking-widest">RED_AI // EXECUTION_STREAM</h4>
+                            </div>
+                            <pre className="text-[10px] text-red-200/80 font-mono overflow-auto flex-1 whitespace-pre-wrap selection:bg-red-500/20">
+                                {activeLog ? activeLog.red_raw_console : "Awaiting transmission payload..."}
+                            </pre>
+                        </div>
+
+                        {/* Blue Agent Raw Console Output */}
+                        <div className="bg-black/80 border border-cyan-950/60 rounded-xl flex flex-col overflow-hidden p-4 shadow-lg">
+                            <div className="flex items-center gap-2 border-b border-cyan-950/40 pb-2 mb-2">
+                                <span className="h-2 w-2 rounded-full bg-cyan-500"></span>
+                                <h4 className="text-[10px] font-bold uppercase text-cyan-400 tracking-widest">BLUE_AI // KERNEL_TELEMETRY</h4>
+                            </div>
+                            <pre className="text-[10px] text-cyan-200/80 font-mono overflow-auto flex-1 whitespace-pre-wrap selection:bg-cyan-500/20">
+                                {activeLog ? activeLog.blue_raw_console : "Awaiting process scanning data..."}
+                            </pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    const container = document.getElementById('amcop-root');
+    const root = ReactDOM.createRoot(container);
+    root.render(<AmcopDashboard />);
+</script>
+</body>
+</html>
