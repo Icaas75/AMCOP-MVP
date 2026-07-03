@@ -45,31 +45,75 @@ def run_red_agent(target_ip, target_port, username, password, mitre_technique):
         return "CONNECTION_ERROR", error_msg
 
 # ==========================================
-# 2. REAL BLUE AI AGENT
+# 2. ADVANCED BLUE AI AGENT (BEHAVIORAL TELEMETRY)
 # ==========================================
+
 def run_blue_agent(target_ip, attack_timestamp):
     print(f"\n[🔵 BLUE AI] Analyzing security events for target: {target_ip}")
     
     try:
         client = docker.from_env()
-        # Connects to your real, running local target node container
         container = client.containers.get("target-node-01")
         
-        print(f"[🔵 BLUE AI] Inspecting live active process telemetry trees...")
+        # 1. Gather real-time runtime process states
         exec_result = container.exec_run("ps aux")
         raw_telemetry = exec_result.output.decode("utf-8").strip()
         
-        # Threat signature tracking: look for interactive signatures or discovery tools
-        signatures = ["sshd", "passwd", "netstat", "ss"]
+        # 2. ADVANCED FEATURE: Behavioral Anomaly Inspection Logic
+        # Instead of basic string matching, we parse the real Linux metrics line-by-line
+        lines = raw_telemetry.split("\n")
+        anomaly_score = 0
+        risk_indicators = []
         
-        detection_triggered = False
-        for sig in signatures:
-            if sig in raw_telemetry:
-                detection_triggered = True
-                break
+        for line in lines[1:]:  # Skip the header row
+            parts = line.split()
+            if len(parts) < 11:
+                continue
                 
+            user = parts[0]      # The user executing the binary
+            pid = parts[1]       # Process ID
+            cpu = float(parts[2])# CPU Consumption
+            command = " ".join(parts[10:]) # Full execution string
+            
+            # Behavioral Rule A: Administrative Shell Reconnaissance Tracking
+            if user == "root" and any(cmd in command for cmd in ["cat /etc", "netstat", "ss"]):
+                anomaly_score += 40
+                risk_indicators.append(f"High-risk administrative discovery: PID {pid} ({command})")
+                
+            # Behavioral Rule B: Evasion Tracking (Processes spawned silently in background)
+            if "sleep" in command or "nohup" in command:
+                anomaly_score += 30
+                risk_indicators.append(f"Potential execution persistence/evasion: PID {pid}")
+                
+            # Behavioral Rule C: Non-TTY Shell spawning
+            if "sshd:" in command and "notty" in command:
+                anomaly_score += 35
+                risk_indicators.append(f"Rogue non-interactive shell socket verified: PID {pid}")
+
+        # Determine detection state based on calculated anomaly thresholds
+        detection_triggered = anomaly_score >= 40
         status = "DETECTED" if detection_triggered else "MISSED"
-        return status, raw_telemetry
+        
+        # Format a highly professional analyst telemetry report for the dashboard console view
+        formatted_analysis = (
+            f"=== BLUE AI RUNTIME SECURITY ANALYSIS ===\n"
+            f"Target Namespace   : target-node-01\n"
+            f"Telemetry Source   : Linux Kernel Process Tree via Docker Socket\n"
+            f"Processes Audited  : {len(lines) - 1}\n"
+            f"Calculated Threat Anomaly Score: {anomaly_score}/100\n"
+            f"--------------------------------------------------\n"
+            f"Active Behavioral Alerts:\n"
+        )
+        
+        if risk_indicators:
+            for indicator in risk_indicators:
+                formatted_analysis += f"[⚠️ RISK ALERT] {indicator}\n"
+        else:
+            formatted_analysis += "[✓] System baseline normal. No anomalies identified.\n"
+            
+        formatted_analysis += f"\n=== RAW telemetRY SNAPSHOT ===\n{raw_telemetry}"
+        
+        return status, formatted_analysis
             
     except Exception as e:
         error_msg = f"DOCKER CONTAINER TELEMETRY ERROR: Is 'target-node-01' running?\nDetails: {e}"
