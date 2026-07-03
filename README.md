@@ -1,4 +1,4 @@
-# AMCOP // Advanced Multi-Agent Cyber Orchestration Platform
+# AMCOP // Autonomous Multi-Agent Cyber Operation Platform
 
 AMCOP (Advanced Multi-Agent Cyber Orchestration Platform) is an automated cyber range and continuous security validation engine. It utilizes an autonomous three-agent framework (Red AI, Blue AI, and White AI) to execute safe MITRE ATT&CK adversarial simulation payloads against real containerized production sandboxes, gather real-time kernel telemetry, and evaluate operational resilience continuously.
 
