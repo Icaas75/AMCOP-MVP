@@ -1,0 +1,32 @@
+# AMCOP lab infrastructure — authorized, isolated cyber range ONLY.
+# Spins up the MongoDB datastore and a disposable SSH target container on a
+# dedicated bridge network. The target is intentionally vulnerable and must
+# never be published beyond localhost.
+services:
+  amcop-db:
+    image: mongo:latest
+    container_name: amcop-db
+    ports:
+      - "127.0.0.1:27017:27017"   # bind loopback only
+    networks:
+      - amcop_range
+    restart: unless-stopped
+
+  target-node-01:
+    image: rastasheep/ubuntu-sshd
+    container_name: target-node-01
+    # Self-provisioning: the base image ships without netstat/ss, which the
+    # Red AI T1049 payload requires. Install on first start, then run sshd.
+    # (Verified: apt works on this image; install is a no-op on restarts.)
+    command: >-
+      sh -c "apt-get update -qq && apt-get install -y -qq net-tools iproute2
+      >/dev/null 2>&1; exec /usr/sbin/sshd -D"
+    ports:
+      - "127.0.0.1:2222:22"       # SSH bound to loopback only
+    networks:
+      - amcop_range
+    restart: unless-stopped
+
+networks:
+  amcop_range:
+    driver: bridge

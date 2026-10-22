@@ -1,0 +1,119 @@
+"""API tests for the AMCOP FastAPI app (hermetic: engine and DB mocked).
+
+Live infra is NOT required. Run:  python -m unittest discover -s tests -v
+"""
+import unittest
+from unittest import mock
+
+from fastapi.testclient import TestClient
+
+import app as app_module
+import amcop_engine
+import config
+
+
+class TestHealthEndpoint(unittest.TestCase):
+    def test_health_reports_status(self):
+        client = TestClient(app_module.app)
+        resp = client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn(body["status"], ("OK",))
+        self.assertIn(body["database"], ("UP", "DOWN"))
+
+
+class TestDashboard(unittest.TestCase):
+    def test_dashboard_serves_200_with_war_room_marker(self):
+        client = TestClient(app_module.app)
+        resp = client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("AMCOP", resp.text)
+        self.assertIn("EventSource", resp.text)  # SSE client present
+
+
+class TestExecuteSimulation(unittest.TestCase):
+    def test_successful_cycle_returns_result_summary(self):
+        fake_report = {
+            "red_outcome": "SUCCESS",
+            "blue_outcome": "DETECTED",
+            "system_resilience": "RESILIENT",
+        }
+        client = TestClient(app_module.app)
+        with mock.patch.object(amcop_engine, "trigger_manual_simulation",
+                               return_value=fake_report) as mocked:
+            resp = client.post("/execute-simulation/T1087")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["status"], "LAUNCHED")
+        self.assertEqual(body["technique"], "T1087")
+        self.assertEqual(body["result"]["red_outcome"], "SUCCESS")
+        self.assertEqual(body["result"]["blue_outcome"], "DETECTED")
+        self.assertEqual(body["result"]["system_resilience"], "RESILIENT")
+        mocked.assert_called_once_with("T1087")
+
+    def test_engine_exception_returns_clean_500(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(amcop_engine, "trigger_manual_simulation",
+                               side_effect=RuntimeError("boom")):
+            resp = client.post("/execute-simulation/T1087")
+        self.assertEqual(resp.status_code, 500)
+        body = resp.json()
+        self.assertEqual(body["status"], "ERROR")
+        self.assertNotIn("boom", body["detail"])  # no internals leaked
+
+
+class TestMetricsAggregation(unittest.TestCase):
+    def test_metrics_computed_from_logs(self):
+        fake_logs = [
+            {"_id": "a", "system_resilience": "RESILIENT"},
+            {"_id": "b", "system_resilience": "VULNERABLE"},
+            {"_id": "c", "system_resilience": "RESILIENT"},
+        ]
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            data = app_module.fetch_operational_history_sync()
+
+        self.assertEqual(data["metrics"]["total"], 3)
+        self.assertEqual(data["metrics"]["resilient"], 2)
+        self.assertEqual(data["metrics"]["vulnerable"], 1)
+        self.assertEqual(data["metrics"]["catch_rate"], 67)
+        self.assertEqual(len(data["logs"]), 3)
+
+    def test_metrics_zero_when_db_unreachable(self):
+        with mock.patch.object(config, "get_mongo_client",
+                               side_effect=RuntimeError("no db")):
+            data = app_module.fetch_operational_history_sync()
+        self.assertEqual(data["logs"], [])
+        self.assertEqual(data["metrics"]["catch_rate"], 0)
+
+
+class TestCORSRestricted(unittest.TestCase):
+    def test_no_wildcard_cors_by_default(self):
+        # Default config installs no CORS middleware; ensure no * origin.
+        origins = []
+        for middleware in app_module.app.user_middleware:
+            origins.append(getattr(middleware, "kwargs", {}).get("allow_origins"))
+        self.assertNotIn(["*"], origins)
+
+
+if __name__ == "__main__":
+    unittest.main()
