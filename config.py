@@ -68,6 +68,20 @@ APP_PORT = int(env("AMCOP_APP_PORT", "5000"))
 # installed at all; the dashboard is served same-origin from this app.
 CORS_ORIGINS = [o.strip() for o in env("AMCOP_CORS_ORIGINS", "").split(",") if o.strip()]
 
+# --- AI-Assisted Incident Analyst (optional LLM integration) -----------------
+# Feature degrades gracefully to "unavailable" when the key is absent.
+# Any OpenAI-compatible chat-completions endpoint works via BASE_URL.
+LLM_API_KEY = env("AMCOP_LLM_API_KEY", "")
+LLM_MODEL = env("AMCOP_LLM_MODEL", "gpt-4o-mini")
+LLM_BASE_URL = env("AMCOP_LLM_BASE_URL", "https://api.openai.com/v1")
+LLM_TIMEOUT_S = int(env("AMCOP_LLM_TIMEOUT_S", "30"))
+LLM_MAX_TOKENS = int(env("AMCOP_LLM_MAX_TOKENS", "700"))
+
+
+def llm_available():
+    """The analyst feature requires an explicit credential."""
+    return bool(LLM_API_KEY)
+
 
 def get_mongo_client():
     """Single factory so app and engine agree on URI and timeouts."""

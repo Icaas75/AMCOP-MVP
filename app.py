@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -9,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 
 import config
 import amcop_engine
+import analyst_service
 
 app = FastAPI(title="AMCOP Advanced C2 Platform")
 
@@ -198,6 +200,53 @@ async def assessment_report():
         }
 
     return await run_in_threadpool(_build_sync)
+
+
+_OBJECTID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+
+# Analyst outcome -> HTTP status (kept next to the route it serves).
+_ANALYST_HTTP = {
+    analyst_service.OK: 200,
+    analyst_service.UNAVAILABLE: 503,
+    analyst_service.TIMEOUT: 504,
+    analyst_service.API_ERROR: 502,
+    analyst_service.INVALID_OUTPUT: 502,
+}
+
+
+@app.post("/analyze-operation/{operation_id}")
+async def analyze_operation(operation_id: str):
+    """AI-Assisted Incident Analyst: evidence-grounded explanation of ONE
+    completed operation. Read-only: never writes records or touches verdicts
+    or metrics."""
+    # Validate identifier at the API boundary (same convention as techniques).
+    if not _OBJECTID_RE.match(operation_id):
+        return JSONResponse(
+            status_code=422,
+            content={"status": "ERROR", "detail": "Invalid operation identifier; "
+                                                  "expected a 24-character hex id."},
+        )
+
+    def _analyze_sync():
+        try:
+            from bson import ObjectId
+            client = config.get_mongo_client()
+            record = client[config.MONGO_DB][config.MONGO_COLLECTION].find_one(
+                {"_id": ObjectId(operation_id)})
+        except Exception as e:
+            print(f"[ANALYST] MongoDB lookup failed: {e}")
+            record = None
+        if record is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "ERROR",
+                         "detail": "Operation record not found."},
+            )
+        status, payload = analyst_service.analyze_operation(record)
+        return JSONResponse(status_code=_ANALYST_HTTP[status], content=payload)
+
+    # Blocking HTTP to the provider runs in the threadpool like other sync work.
+    return await run_in_threadpool(_analyze_sync)
 
 
 @app.get("/health")
