@@ -98,6 +98,105 @@ class TestMetricsAggregation(unittest.TestCase):
         self.assertEqual(data["metrics"]["catch_rate"], 67)
         self.assertEqual(len(data["logs"]), 3)
 
+    def test_confusion_matrix_and_detection_rate(self):
+        fake_logs = [
+            {"red_outcome": "SUCCESS", "blue_outcome": "DETECTED"},   # TP
+            {"red_outcome": "SUCCESS", "blue_outcome": "MISSED"},     # FN
+            {"red_outcome": "SUCCESS", "blue_outcome": "DETECTED"},   # TP
+            {"red_outcome": "CONNECTION_ERROR", "blue_outcome": "MISSED"},  # TN
+            {"red_outcome": "FAILED", "blue_outcome": "DETECTED"},    # FP
+            {"system_resilience": "RESILIENT"},                        # legacy: excluded
+        ]
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            data = app_module.fetch_operational_history_sync()
+
+        confusion = data["metrics"]["confusion"]
+        self.assertEqual(confusion["TP"], 2)
+        self.assertEqual(confusion["FN"], 1)
+        self.assertEqual(confusion["FP_SUSPECTED"], 1)
+        self.assertEqual(confusion["TN"], 1)
+        # detection_rate denominator = ground-truth-positive (TP+FN) = 3
+        self.assertEqual(data["metrics"]["detection_rate"], 67)
+
+    def test_telemetry_error_record_does_not_crash_metrics(self):
+        # Regression: a real DB record with blue_outcome=TELEMETRY_ERROR
+        # classifies as UNSCORED_TELEMETRY_ERROR and must not KeyError.
+        fake_logs = [
+            {"red_outcome": "SUCCESS", "blue_outcome": "TELEMETRY_ERROR"},
+            {"red_outcome": "SUCCESS", "blue_outcome": "DETECTED"},
+        ]
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            data = app_module.fetch_operational_history_sync()
+        self.assertEqual(
+            data["metrics"]["confusion"]["UNSCORED_TELEMETRY_ERROR"], 1)
+        self.assertEqual(data["metrics"]["confusion"]["TP"], 1)
+
+    def test_detection_rate_none_without_positive_cycles(self):
+        fake_logs = [{"red_outcome": "CONNECTION_ERROR", "blue_outcome": "MISSED"}]
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            data = app_module.fetch_operational_history_sync()
+        self.assertIsNone(data["metrics"]["detection_rate"])
+
     def test_metrics_zero_when_db_unreachable(self):
         with mock.patch.object(config, "get_mongo_client",
                                side_effect=RuntimeError("no db")):
@@ -113,6 +212,94 @@ class TestCORSRestricted(unittest.TestCase):
         for middleware in app_module.app.user_middleware:
             origins.append(getattr(middleware, "kwargs", {}).get("allow_origins"))
         self.assertNotIn(["*"], origins)
+
+
+class TestAssessmentReport(unittest.TestCase):
+    def _fake_logs(self):
+        return [
+            {"mitre_technique": "T1087", "technique_name": "Account Discovery",
+             "red_outcome": "SUCCESS", "blue_outcome": "DETECTED"},
+            {"mitre_technique": "T1087", "technique_name": "Account Discovery",
+             "red_outcome": "SUCCESS", "blue_outcome": "MISSED"},
+            {"mitre_technique": "T1049", "technique_name": "Network Connections Discovery",
+             "red_outcome": "CONNECTION_ERROR", "blue_outcome": "MISSED"},
+        ]
+
+    def test_report_structure_and_gap_detection(self):
+        fake_logs = self._fake_logs()
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            resp = client.get("/assessment-report")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+
+        self.assertEqual(body["generated_from_cycles"], 3)
+        t1087 = body["per_technique"]["T1087"]
+        self.assertEqual(t1087["attempted"], 2)
+        self.assertEqual(t1087["executed"], 2)
+        self.assertEqual(t1087["detected"], 1)
+        self.assertEqual(t1087["missed"], 1)
+        t1049 = body["per_technique"]["T1049"]
+        self.assertEqual(t1049["execution_failures"], 1)
+
+        # Gaps derived strictly from the records: missed detection + execution
+        # failure + never-attempted techniques (T1082/T1016).
+        gaps_text = " ".join(body["gaps"])
+        self.assertIn("T1087", gaps_text)
+        self.assertIn("not detected", gaps_text)
+        self.assertIn("T1049", gaps_text)
+        self.assertIn("T1082", gaps_text)
+        self.assertIn("T1016", gaps_text)
+        self.assertTrue(body["limitations"])
+
+    def test_report_with_empty_db(self):
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return []
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            resp = client.get("/assessment-report")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["generated_from_cycles"], 0)
+        self.assertEqual(body["per_technique"], {})
+        self.assertIn("T1082", " ".join(body["gaps"]))  # never attempted
 
 
 if __name__ == "__main__":

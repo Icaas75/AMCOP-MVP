@@ -126,9 +126,108 @@ class TestTechniquePayloads(unittest.TestCase):
         self.assertEqual(amcop_engine.get_payload_for_technique("T1087"), "cat /etc/passwd")
         self.assertEqual(
             amcop_engine.get_payload_for_technique("T1049"), "netstat -an || ss -tulpn")
+        self.assertEqual(amcop_engine.get_payload_for_technique("T1082"), "uname -a")
+        self.assertEqual(
+            amcop_engine.get_payload_for_technique("T1016"), "ip addr || ifconfig -a")
 
     def test_unknown_technique_falls_back(self):
         self.assertEqual(amcop_engine.get_payload_for_technique("T9999"), "uname -a")
+
+    def test_technique_names(self):
+        self.assertEqual(amcop_engine.get_technique_name("T1082"),
+                         "System Information Discovery")
+        self.assertEqual(amcop_engine.get_technique_name("T1016"),
+                         "System Network Configuration Discovery")
+        self.assertEqual(amcop_engine.get_technique_name("T9999"),
+                         "Unknown / custom technique")
+
+    def test_registry_entries_have_id_name_payload(self):
+        for tech_id, entry in amcop_engine.TECHNIQUES.items():
+            self.assertRegex(tech_id, r"^T\d{4}$")
+            self.assertTrue(entry["name"])
+            self.assertTrue(entry["payload"])
+
+
+class TestNewTechniqueDetectionSignatures(unittest.TestCase):
+    """Blue AI must detect T1082/T1016 recon from observed evidence."""
+
+    def test_uname_recon_detected(self):
+        telemetry = "\n".join([
+            PS_HEADER,
+            ps_line(user="root", pid="601", command="uname -a"),
+        ])
+        status, score, indicators, *_ = amcop_engine.analyze_process_tree(telemetry)
+        self.assertEqual(status, "DETECTED")
+        self.assertEqual(score, 40)
+        self.assertIn("601", indicators[0])
+
+    def test_ip_addr_recon_detected(self):
+        telemetry = "\n".join([
+            PS_HEADER,
+            ps_line(user="root", pid="602", command="ip addr"),
+        ])
+        status, score, *_ = amcop_engine.analyze_process_tree(telemetry)
+        self.assertEqual(status, "DETECTED")
+        self.assertEqual(score, 40)
+
+    def test_ifconfig_recon_detected(self):
+        telemetry = "\n".join([
+            PS_HEADER,
+            ps_line(user="root", pid="603", command="ifconfig -a"),
+        ])
+        status, score, *_ = amcop_engine.analyze_process_tree(telemetry)
+        self.assertEqual(status, "DETECTED")
+
+    def test_non_root_uname_not_scored(self):
+        telemetry = "\n".join([
+            PS_HEADER,
+            ps_line(user="www", pid="604", command="uname -a"),
+        ])
+        status, score, *_ = amcop_engine.analyze_process_tree(telemetry)
+        self.assertEqual(status, "MISSED")
+        self.assertEqual(score, 0)
+
+
+class TestClassifyDetection(unittest.TestCase):
+    """Confusion-matrix classification using execution ground truth."""
+
+    def test_true_positive(self):
+        self.assertEqual(amcop_engine.classify_detection("SUCCESS", "DETECTED"), "TP")
+
+    def test_false_negative(self):
+        self.assertEqual(amcop_engine.classify_detection("SUCCESS", "MISSED"), "FN")
+
+    def test_flagged_without_execution_is_fp_suspected(self):
+        for red in ("FAILED", "CONNECTION_ERROR", "COMMAND_TIMEOUT"):
+            self.assertEqual(
+                amcop_engine.classify_detection(red, "DETECTED"), "FP_SUSPECTED", red)
+
+    def test_no_execution_no_flag_is_tn(self):
+        for red in ("FAILED", "CONNECTION_ERROR", "COMMAND_TIMEOUT"):
+            self.assertEqual(amcop_engine.classify_detection(red, "MISSED"), "TN", red)
+
+    def test_telemetry_error_is_unscored(self):
+        self.assertEqual(
+            amcop_engine.classify_detection("SUCCESS", "TELEMETRY_ERROR"),
+            "UNSCORED_TELEMETRY_ERROR")
+
+
+class TestDetectionRationale(unittest.TestCase):
+    def test_rationale_cites_evidence(self):
+        evidence = {"anomaly_score": 40, "threshold": 40,
+                    "risk_indicators": ["Rogue shell: PID 5"]}
+        text = amcop_engine.detection_rationale("SUCCESS", "DETECTED", evidence)
+        self.assertIn("40", text)
+        self.assertIn("PID 5", text)
+
+    def test_miss_rationale_states_threshold(self):
+        evidence = {"anomaly_score": 0, "threshold": 40, "risk_indicators": []}
+        text = amcop_engine.detection_rationale("SUCCESS", "MISSED", evidence)
+        self.assertIn("below", text)
+
+    def test_telemetry_error_rationale_unscored(self):
+        text = amcop_engine.detection_rationale("SUCCESS", "TELEMETRY_ERROR", None)
+        self.assertIn("unscored", text.lower())
 
 
 if __name__ == "__main__":

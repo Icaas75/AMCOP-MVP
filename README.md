@@ -16,9 +16,21 @@ metrics to a web dashboard.
 
 | Agent | Role | Mechanism |
 |---|---|---|
-| 🔴 Red AI | Adversary | SSH (`paramiko`) into the target container and executes a technique payload (e.g. `T1087` → `cat /etc/passwd`). The session is **kept open** during Blue's snapshot so the attacker's channel is observable. |
-| 🔵 Blue AI | Defender | Reads `ps aux` from the live container over the Docker socket, scores behavioral rules (admin recon, evasion, non-TTY remote shells), and reports `DETECTED` / `MISSED` at a threshold of 40. |
-| ⚪ White AI | Orchestrator | Runs Red → observation window → Blue, judges `RESILIENT` (attack succeeded **and** detected) vs `VULNERABLE`, persists the report to MongoDB. |
+| 🔴 Red AI | Adversary | SSH (`paramiko`) into the target container and executes a technique payload. The session is **kept open** during Blue's snapshot so the attacker's channel is observable. |
+| 🔵 Blue AI | Defender | Reads `ps aux` from the live container over the Docker socket, scores behavioral rules (admin recon incl. `uname`/`ip addr`/`ifconfig`, evasion, non-TTY remote shells), and reports `DETECTED` / `MISSED` at a threshold of 40 — decided **only** from observed evidence, never from Red's self-report. |
+| ⚪ White AI | Orchestrator | Runs Red → observation window → Blue, judges `RESILIENT` (attack succeeded **and** detected) vs `VULNERABLE`, classifies TP/FP/TN/FN against execution ground truth, records detection latency + rationale, persists the report to MongoDB. |
+
+### Implemented techniques
+
+| ID | Name | Payload (read-only recon) |
+|---|---|---|
+| T1087 | Account Discovery | `cat /etc/passwd` |
+| T1049 | Network Connections Discovery | `netstat -an \|\| ss -tulpn` |
+| T1082 | System Information Discovery | `uname -a` |
+| T1016 | System Network Configuration Discovery | `ip addr \|\| ifconfig -a` |
+
+Unknown IDs fall back to `uname -a`. Payloads execute only over SSH to the
+loopback-bound lab container — no scanning, no lateral movement, no writes.
 
 **Data flow:** dashboard button → `POST /execute-simulation/{technique}` →
 Red/Blue/White cycle → MongoDB → `GET /stream-telemetry` (SSE, 1 Hz) → live
@@ -97,7 +109,10 @@ python -m unittest discover -s tests -v
    - **BLUE_AI console**: `Anomaly Score: 40/100` with a `RISK ALERT` for the
      rogue non-interactive shell (and/or admin recon)
    - **Ledger**: new row with green `RESILIENT`
-4. Repeat with `T1049 - Net Connections Discovery` — expect the same result.
+4. Repeat with `T1049 - Net Connections Discovery`, then demonstrate the new
+   coverage: `T1082 - System Information Discovery` (`uname -a`) and
+   `T1016 - System Network Configuration Discovery` (`ip addr`) — expect the
+   same RESILIENT result with recon evidence in the BLUE_AI console.
 5. Point at the **Cyber Resilience Drift Timeline** (new 100 point appended)
    and the **catch-rate gauge** updating live with no page refresh.
 6. Run the automated repeatability proof:
@@ -163,31 +178,65 @@ services without error.
 
 ---
 
+## Evaluation metrics — definitions
+
+Every cycle record now stores evaluation-integrity fields:
+
+- `technique_name`, `red_outcome`, `blue_outcome`, `system_resilience`
+- `detection_evidence` — anomaly score, threshold, risk indicators, processes
+  audited (Blue's decision input)
+- `detection_rationale` — human-readable justification of the decision
+- `detection_latency_ms` — Red payload launch → Blue decision complete;
+  includes the fixed 1s observation window (pipeline delay, not dwell time)
+- `confusion_class` — `TP` / `FN` / `FP_SUSPECTED` / `TN`, using execution
+  ground truth (red `SUCCESS` = attack actually ran). Telemetry errors are
+  `UNSCORED_TELEMETRY_ERROR`; execution failures are tracked separately from
+  detection failures.
+
+**`catch_rate`** (dashboard gauge) = RESILIENT cycles ÷ all cycles in the last
+50. Its denominator **includes execution failures and telemetry errors**, so
+it is a platform-outcome rate, not a detection rate.
+
+**`detection_rate`** (API `metrics.detection_rate` and `/assessment-report`)
+= TP ÷ (TP + FN) — the true-positive rate over cycles where the attack
+actually executed. `null` when no ground-truth-positive cycles exist.
+
+## Assessment report
+
+`GET /assessment-report` returns a persistent, readable summary computed
+strictly from recorded MongoDB cycles (nothing invented): per-technique
+attempted/executed/detected/missed/execution-failure counts, the confusion
+matrix, both rates, data-derived gaps (missed detections, execution failures,
+techniques never attempted) and evaluation limitations.
+
+---
+
 ## Evaluation results (2026-10-22)
 
 | Check | Result |
 |---|---|
-| `python -m unittest discover -s tests` | **23/23 pass** (incl. 2 live integration) |
-| Full cycle ×6 via API (3× T1087, 3× T1049) | **6/6 `SUCCESS / DETECTED / RESILIENT`** |
+| `python -m unittest discover -s tests` | **43/43 pass** (incl. live integration) |
+| Full cycle ×4 via API (T1087, T1049, T1082, T1016) | **4/4 `SUCCESS / DETECTED / RESILIENT`** |
+| New techniques T1082/T1016 | verified live with evidence + TP classification |
 | Repeatability (3 consecutive cycles, live test) | **3/3 DETECTED** |
 | MongoDB ↔ API ↔ SSE agreement | Identical verdicts on newest records |
-| `/health`, `/`, `/stream-telemetry` | `200` / `200` / streaming 1 Hz |
+| `/health`, `/`, `/stream-telemetry`, `/assessment-report` | `200` / `200` / streaming 1 Hz / `200` |
 | Windows Unicode crash on `/execute-simulation` | **Fixed** (UTF-8 console reconfigure) |
 | Wildcard CORS / hardcoded secrets in code | **Removed** |
 
 ## Known limitations
 
-1. **Detection is signature/rule-based**, not ML — three fixed behavioral
-   rules with a 40-point threshold; novel techniques won't be detected.
-   Score is capped at 100 for display.
-2. **False positives are possible**: any root `netstat`/`cat /etc` process or
-   non-TTY sshd session in the target scores as risk, regardless of intent.
-3. **Catch-rate gauge** is computed over the **most recent 50 cycles**, so it
-   includes historical (pre-fix) `VULNERABLE` records and rises as new
-   resilient cycles rotate in.
-4. **Two techniques implemented** (T1087, T1049); unknown IDs fall back to
-   `uname -a`. Payloads are read-only discovery — no impact/impact-adjacent
-   techniques.
+1. **Detection is signature/rule-based**, not ML — fixed behavioral rules with
+   a 40-point threshold; novel techniques won't be detected. Score capped at
+   100 for display.
+2. **False positives are possible**: any root `netstat`/`cat /etc`/`uname`
+   process or non-TTY sshd session in the target scores as risk, regardless
+   of intent. `FP_SUSPECTED` cycles in the report reflect this.
+3. **Catch-rate gauge** uses all 50 recent cycles in its denominator,
+   including historical pre-fix `VULNERABLE` and infrastructure-failure
+   records; use `detection_rate` for the detection-pipeline view.
+4. **Four techniques implemented** (T1087, T1049, T1082, T1016); unknown IDs
+   fall back to `uname -a`. Payloads are read-only discovery.
 5. **SSE loop runs per client forever** — fine for a demo, would need a
    connection manager for many concurrent viewers.
 6. **Dashboard loads React/Babel/Tailwind from CDN** at runtime; requires
@@ -196,6 +245,8 @@ services without error.
    compose file binds port 2222 to loopback).
 8. **Timestamps are second-granularity local time**; two cycles in the same
    second can share a `timestamp` field.
+9. **Detection latency includes the fixed 1s observation window** (~1.3–1.4s
+   observed); it measures platform pipeline delay, not attacker dwell time.
 
 ## Remaining submission blockers
 

@@ -27,35 +27,72 @@ if config.CORS_ORIGINS:
 DASHBOARD_PATH = Path(__file__).resolve().parent / "templates" / "dashboard.html"
 
 
+HISTORY_WINDOW = 50  # metrics are computed over the most recent N cycles
+
+
+def compute_metrics(raw_logs):
+    """Evaluation-integrity metrics over a window of cycle records.
+
+    catch_rate -- denominator: ALL cycles in the window, including execution
+    failures (CONNECTION_ERROR etc.) and telemetry errors. It measures the
+    fraction of attempted simulations that ended RESILIENT (attack executed
+    AND detected). It is NOT a comprehensive detection rate: it mixes
+    infrastructure failures into its denominator and the test design (four
+    pre-signatured techniques) does not cover novel attacks.
+
+    detection_rate -- denominator: cycles where the attack actually executed
+    (ground truth positive, red_outcome == SUCCESS). That is the honest
+    true-positive rate for the detection pipeline. Records without
+    red_outcome/blue_outcome (legacy) are excluded.
+    """
+    total = len(raw_logs)
+    resilient = sum(1 for log in raw_logs if log.get("system_resilience") == "RESILIENT")
+    vulnerable = total - resilient
+    catch_rate = round((resilient / total) * 100) if total > 0 else 0
+
+    from collections import Counter
+    confusion = Counter()
+    for log in raw_logs:
+        red, blue = log.get("red_outcome"), log.get("blue_outcome")
+        if red is None or blue is None:
+            continue  # legacy record: not classifiable
+        confusion[amcop_engine.classify_detection(red, blue)] += 1
+    # Zero-fill known classes so the shape is stable for consumers.
+    for key in ("TP", "FN", "FP_SUSPECTED", "TN", "UNSCORED",
+                "UNSCORED_TELEMETRY_ERROR"):
+        confusion.setdefault(key, 0)
+
+    ground_truth_positive = confusion["TP"] + confusion["FN"]
+    detection_rate = (round((confusion["TP"] / ground_truth_positive) * 100)
+                      if ground_truth_positive > 0 else None)
+
+    return {
+        "total": total,
+        "resilient": resilient,
+        "vulnerable": vulnerable,
+        "catch_rate": catch_rate,
+        "confusion": confusion,
+        "detection_rate": detection_rate,  # None = no ground-truth-positive cycles
+        "window": HISTORY_WINDOW,
+    }
+
+
 def fetch_operational_history_sync():
     """Synchronous helper to pull logs for the fallback/initial state."""
     try:
         client = config.get_mongo_client()
         collection = client[config.MONGO_DB][config.MONGO_COLLECTION]
 
-        raw_logs = list(collection.find().sort("_id", -1).limit(50))
-
-        total = len(raw_logs)
-        resilient = sum(1 for log in raw_logs if log.get("system_resilience") == "RESILIENT")
-        vulnerable = total - resilient
-        catch_rate = round((resilient / total) * 100) if total > 0 else 0
+        raw_logs = list(collection.find().sort("_id", -1).limit(HISTORY_WINDOW))
 
         for log in raw_logs:
             if "_id" in log:
                 log["_id"] = str(log["_id"])
 
-        return {
-            "logs": raw_logs,
-            "metrics": {
-                "total": total,
-                "resilient": resilient,
-                "vulnerable": vulnerable,
-                "catch_rate": catch_rate
-            }
-        }
+        return {"logs": raw_logs, "metrics": compute_metrics(raw_logs)}
     except Exception as e:
         print(f"[DB CACHE FALLBACK] Could not reach MongoDB: {e}")
-        return {"logs": [], "metrics": {"total": 0, "resilient": 0, "vulnerable": 0, "catch_rate": 0}}
+        return {"logs": [], "metrics": compute_metrics([])}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -65,6 +102,80 @@ async def serve_tactical_dashboard():
         return HTMLResponse(content=DASHBOARD_PATH.read_text(encoding="utf-8"), status_code=200)
     except Exception as e:
         return HTMLResponse(content=f"<h3>Error loading dashboard: {e}</h3>", status_code=500)
+
+
+@app.get("/assessment-report")
+async def assessment_report():
+    """Persistent, readable assessment summary built from recorded cycles.
+
+    Derived strictly from MongoDB records -- no invented scores or verdicts.
+    Gaps are computed from observed outcomes (missed detections, execution
+    failures, techniques never attempted).
+    """
+    def _build_sync():
+        try:
+            client = config.get_mongo_client()
+            collection = client[config.MONGO_DB][config.MONGO_COLLECTION]
+            logs = list(collection.find().sort("_id", -1).limit(500))
+        except Exception as e:
+            print(f"[ASSESSMENT REPORT] MongoDB unavailable: {e}")
+            logs = []
+
+        metrics = compute_metrics(logs)
+
+        per_technique = {}
+        for log in logs:
+            tech = log.get("mitre_technique", "UNKNOWN")
+            t = per_technique.setdefault(tech, {
+                "technique_name": log.get("technique_name"),
+                "attempted": 0, "executed": 0, "detected": 0, "missed": 0,
+                "execution_failures": 0,
+            })
+            t["attempted"] += 1
+            red, blue = log.get("red_outcome"), log.get("blue_outcome")
+            if red == "SUCCESS":
+                t["executed"] += 1
+                if blue == "DETECTED":
+                    t["detected"] += 1
+                elif blue == "MISSED":
+                    t["missed"] += 1
+            elif red in ("FAILED", "CONNECTION_ERROR", "COMMAND_TIMEOUT"):
+                t["execution_failures"] += 1
+
+        never_attempted = sorted(set(amcop_engine.TECHNIQUES) - set(per_technique))
+
+        gaps = []
+        for tech, t in per_technique.items():
+            if t["missed"] > 0:
+                gaps.append(f"{tech}: {t['missed']} executed cycle(s) not detected "
+                            f"(detection rules missed observed evidence)")
+            if t["execution_failures"] > 0:
+                gaps.append(f"{tech}: {t['execution_failures']} execution failure(s) "
+                            f"(infrastructure, not a detection failure)")
+        if never_attempted:
+            gaps.append(f"Techniques implemented but not yet attempted: "
+                        f"{', '.join(never_attempted)}")
+        if metrics["confusion"]["FP_SUSPECTED"] > 0:
+            gaps.append(f"{metrics['confusion']['FP_SUSPECTED']} flag(s) raised without "
+                        f"a successful attack execution (possible false positives; "
+                        f"Blue decisions from held-open SSH sessions)")
+
+        return {
+            "generated_from_cycles": len(logs),
+            "window": HISTORY_WINDOW,
+            "metrics": metrics,
+            "per_technique": per_technique,
+            "gaps": gaps,
+            "limitations": [
+                "Detection is rule-based over `ps aux` snapshots, not ML; only "
+                "implemented techniques can be detected by signature.",
+                "detection_latency_ms includes the fixed 1s observation window.",
+                "FP_SUSPECTED entries are flagged-not-executed cycles; the lab "
+                "holds Red's SSH session open, which Rule C legitimately fires on.",
+            ],
+        }
+
+    return await run_in_threadpool(_build_sync)
 
 
 @app.get("/health")

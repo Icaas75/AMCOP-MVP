@@ -1,3 +1,4 @@
+import socket
 import time
 import datetime
 import paramiko
@@ -5,20 +6,31 @@ import docker
 
 import config
 
+COMMAND_TIMEOUT_S = 10  # payload execution deadline inside the lab target
+
 # ==========================================
 # 1. REAL RED AI AGENT
 # ==========================================
 
-# MITRE ATT&CK technique -> simulated discovery payload (authorized lab only)
-TECHNIQUE_PAYLOADS = {
-    "T1087": "cat /etc/passwd",              # Account Discovery
-    "T1049": "netstat -an || ss -tulpn",     # Network Connections Discovery
+# MITRE ATT&CK technique registry: simulated discovery payloads (authorized
+# lab only). All payloads are read-only recon against the disposable target.
+TECHNIQUES = {
+    "T1087": {"name": "Account Discovery", "payload": "cat /etc/passwd"},
+    "T1049": {"name": "Network Connections Discovery", "payload": "netstat -an || ss -tulpn"},
+    "T1082": {"name": "System Information Discovery", "payload": "uname -a"},
+    "T1016": {"name": "System Network Configuration Discovery", "payload": "ip addr || ifconfig -a"},
 }
 DEFAULT_PAYLOAD = "uname -a"
 
 
 def get_payload_for_technique(mitre_technique):
-    return TECHNIQUE_PAYLOADS.get(mitre_technique, DEFAULT_PAYLOAD)
+    entry = TECHNIQUES.get(mitre_technique)
+    return entry["payload"] if entry else DEFAULT_PAYLOAD
+
+
+def get_technique_name(mitre_technique):
+    entry = TECHNIQUES.get(mitre_technique)
+    return entry["name"] if entry else "Unknown / custom technique"
 
 
 def run_red_agent(target_ip, target_port, username, password, mitre_technique):
@@ -40,10 +52,17 @@ def run_red_agent(target_ip, target_port, username, password, mitre_technique):
                     password=password, timeout=5)
 
         print(f"[RED AI] Executing live instruction: '{command}'")
-        stdin, stdout, stderr = ssh.exec_command(command)
+        # Explicit command timeout: a hung payload must not stall the cycle.
+        stdin, stdout, stderr = ssh.exec_command(command, timeout=COMMAND_TIMEOUT_S)
 
-        output = stdout.read().decode().strip()
-        error = stderr.read().decode().strip()
+        try:
+            output = stdout.read().decode().strip()
+            error = stderr.read().decode().strip()
+        except socket.timeout:
+            ssh.close()
+            return ("COMMAND_TIMEOUT",
+                    f"Command '{command}' exceeded {COMMAND_TIMEOUT_S}s and was aborted.",
+                    None)
 
         if error and not output:
             ssh.close()
@@ -87,8 +106,11 @@ def analyze_process_tree(raw_telemetry):
         pid = parts[1]        # Process ID
         command = " ".join(parts[10:])  # Full execution string
 
-        # Behavioral Rule A: Administrative Shell Reconnaissance Tracking
-        if user == "root" and any(cmd in command for cmd in ["cat /etc", "netstat", "ss -"]):
+        # Behavioral Rule A: Administrative Shell Reconnaissance Tracking.
+        # Covers all four implemented techniques: T1087 (cat /etc), T1049
+        # (netstat/ss), T1082 (uname), T1016 (ip addr/ifconfig).
+        recon_signatures = ["cat /etc", "netstat", "ss -", "uname", "ip addr", "ifconfig"]
+        if user == "root" and any(cmd in command for cmd in recon_signatures):
             anomaly_score += 40
             risk_indicators.append(f"High-risk administrative discovery: PID {pid} ({command})")
 
@@ -124,6 +146,16 @@ def run_blue_agent(target_ip, attack_timestamp):
 
         status, anomaly_score, risk_indicators, audited = analyze_process_tree(raw_telemetry)
 
+        # Structured evidence for evaluation integrity: the decision is made
+        # purely from the observed process tree, never from Red's self-report.
+        evidence = {
+            "anomaly_score": anomaly_score,
+            "threshold": ANOMALY_THRESHOLD,
+            "risk_indicators": risk_indicators,
+            "processes_audited": audited,
+            "telemetry_source": "docker-exec ps aux",
+        }
+
         # Format an analyst telemetry report for the dashboard console view
         formatted_analysis = (
             f"=== BLUE AI RUNTIME SECURITY ANALYSIS ===\n"
@@ -143,13 +175,13 @@ def run_blue_agent(target_ip, attack_timestamp):
 
         formatted_analysis += f"\n=== RAW TELEMETRY SNAPSHOT ===\n{raw_telemetry}"
 
-        return status, formatted_analysis
+        return status, formatted_analysis, evidence
 
     except Exception as e:
         error_msg = (f"DOCKER CONTAINER TELEMETRY ERROR: Is "
                      f"'{config.TARGET_CONTAINER}' running?\nDetails: {e}")
         print(f"[BLUE AI] {error_msg}")
-        return "TELEMETRY_ERROR", error_msg
+        return "TELEMETRY_ERROR", error_msg, None
 
 
 # ==========================================
@@ -162,6 +194,45 @@ def evaluate_resilience(red_status, blue_status):
     if red_status == "SUCCESS" and blue_status == "DETECTED":
         return "RESILIENT"
     return "VULNERABLE"
+
+
+def classify_detection(red_status, blue_status):
+    """Confusion-matrix class using execution ground truth.
+
+    Ground truth = did the attack actually execute (red SUCCESS)?
+      TP: attack executed AND detected        FN: attack executed AND missed
+      FP: attack did NOT execute but flagged  TN: no attack AND not flagged
+    Execution failures (FAILED/CONNECTION_ERROR/COMMAND_TIMEOUT) and telemetry
+    errors are tracked separately -- they are neither detection successes nor
+    detection failures.
+    """
+    if blue_status == "TELEMETRY_ERROR":
+        return "UNSCORED_TELEMETRY_ERROR"
+    if red_status == "SUCCESS":
+        return "TP" if blue_status == "DETECTED" else "FN"
+    # Red did not execute the payload (connection/command failure or timeout)
+    if red_status in ("FAILED", "CONNECTION_ERROR", "COMMAND_TIMEOUT"):
+        if blue_status == "DETECTED":
+            return "FP_SUSPECTED"
+        return "TN"
+    return "UNSCORED"
+
+
+def detection_rationale(red_status, blue_status, evidence):
+    """Human-readable justification stored with every assessment."""
+    if blue_status == "TELEMETRY_ERROR":
+        return "No detection decision: telemetry collection failed (unscored)."
+    if evidence is None:
+        return "No detection decision: evidence unavailable (unscored)."
+    indicators = evidence.get("risk_indicators", [])
+    score = evidence.get("anomaly_score", 0)
+    threshold = evidence.get("threshold", ANOMALY_THRESHOLD)
+    if blue_status == "DETECTED":
+        reasons = "; ".join(indicators) if indicators else "evidence present"
+        return (f"Score {score}/{threshold} threshold met from observed evidence: "
+                f"{reasons}")
+    return (f"Score {score} below {threshold} threshold; no behavioral rule "
+            f"matched the observed process tree.")
 
 
 def log_cycle_to_database(report_data):
@@ -183,8 +254,10 @@ def run_orchestration_cycle(target_ip, target_port, user, pwd, technique):
     print("=" * 50)
 
     red_ssh = None
+    red_started = None
     try:
         # Red AI strikes first; session is kept open on purpose.
+        red_started = time.monotonic()
         red_status, red_output, red_ssh = run_red_agent(
             target_ip, target_port, user, pwd, technique)
 
@@ -192,7 +265,7 @@ def run_orchestration_cycle(target_ip, target_port, user, pwd, technique):
         # SSH session is still alive so Blue AI reliably observes it.
         time.sleep(1)
 
-        blue_status, blue_output = run_blue_agent(target_ip, cycle_start)
+        blue_status, blue_output, blue_evidence = run_blue_agent(target_ip, cycle_start)
     finally:
         # Always tear down the attacker session, even if Blue AI errored.
         if red_ssh is not None:
@@ -201,16 +274,27 @@ def run_orchestration_cycle(target_ip, target_port, user, pwd, technique):
             except Exception:
                 pass
 
+    # Detection latency: Red payload launch -> Blue decision complete. For a
+    # SUCCESS cycle this includes the fixed 1s observation window; it measures
+    # the platform's detection pipeline delay, not attacker dwell time.
+    detection_latency_ms = (
+        int((time.monotonic() - red_started) * 1000) if red_started is not None else None)
+
     report_payload = {
         "timestamp": cycle_start,
         "target_host": target_ip,
         "target_port": target_port,
         "mitre_technique": technique,
+        "technique_name": get_technique_name(technique),
         "red_outcome": red_status,
         "blue_outcome": blue_status,
         "red_raw_console": red_output,
         "blue_raw_console": blue_output,
         "system_resilience": evaluate_resilience(red_status, blue_status),
+        "detection_evidence": blue_evidence,
+        "detection_rationale": detection_rationale(red_status, blue_status, blue_evidence),
+        "detection_latency_ms": detection_latency_ms,
+        "confusion_class": classify_detection(red_status, blue_status),
     }
 
     log_cycle_to_database(report_payload)
