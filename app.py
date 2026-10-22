@@ -121,11 +121,20 @@ async def assessment_report():
             print(f"[ASSESSMENT REPORT] MongoDB unavailable: {e}")
             logs = []
 
-        metrics = compute_metrics(logs)
+        # SHARED METRIC DEFINITION: headline metrics use the exact same window
+        # as /stream-telemetry (most recent HISTORY_WINDOW cycles), so the
+        # dashboard gauge and this report can never diverge on denominator.
+        metrics = compute_metrics(logs[:HISTORY_WINDOW])
 
         per_technique = {}
+        unrecognized_records = 0
         for log in logs:
             tech = log.get("mitre_technique", "UNKNOWN")
+            if tech not in amcop_engine.TECHNIQUES:
+                # Historical/invalid IDs (e.g. NOT-A-TECHNIQUE) are counted but
+                # must NOT appear as technique coverage. History is preserved.
+                unrecognized_records += 1
+                continue
             t = per_technique.setdefault(tech, {
                 "technique_name": log.get("technique_name"),
                 "attempted": 0, "executed": 0, "detected": 0, "missed": 0,
@@ -145,6 +154,10 @@ async def assessment_report():
         never_attempted = sorted(set(amcop_engine.TECHNIQUES) - set(per_technique))
 
         gaps = []
+        if unrecognized_records:
+            gaps.append(f"{unrecognized_records} historical record(s) with "
+                        f"unregistered technique IDs (excluded from technique "
+                        f"coverage; preserved, not deleted)")
         for tech, t in per_technique.items():
             if t["missed"] > 0:
                 gaps.append(f"{tech}: {t['missed']} executed cycle(s) not detected "
@@ -164,6 +177,7 @@ async def assessment_report():
             "generated_from_cycles": len(logs),
             "window": HISTORY_WINDOW,
             "metrics": metrics,
+            "unrecognized_records": unrecognized_records,
             "per_technique": per_technique,
             "gaps": gaps,
             "limitations": [
@@ -172,6 +186,14 @@ async def assessment_report():
                 "detection_latency_ms includes the fixed 1s observation window.",
                 "FP_SUSPECTED entries are flagged-not-executed cycles; the lab "
                 "holds Red's SSH session open, which Rule C legitimately fires on.",
+                "Live detections are driven by the held-open SSH session "
+                "indicator (Rule C). Technique-specific recon rules (Rule A) "
+                "are unit-tested on fixtures, but payload processes normally "
+                "complete before the ps aux snapshot, so rule attribution per "
+                "technique is not claimed from live data.",
+                "Headline metrics cover the most recent "
+                f"{HISTORY_WINDOW} cycles (same window as the dashboard "
+                "gauge); per-technique counts cover up to 500 records.",
             ],
         }
 
@@ -208,6 +230,18 @@ async def stream_telemetry():
 @app.post("/execute-simulation/{technique_id}")
 async def run_c2_simulation(technique_id: str):
     """Triggers the Red/Blue/White orchestration loop on-demand from the UI."""
+    # API-boundary validation: only registered MITRE technique IDs are
+    # accepted. This prevents invalid IDs (e.g. NOT-A-TECHNIQUE) from being
+    # recorded as coverage of a real technique via the payload fallback.
+    if technique_id not in amcop_engine.TECHNIQUES:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "ERROR", "technique": technique_id,
+                     "detail": "Unknown technique ID; not in the registered "
+                               "technique registry.",
+                     "registered": sorted(amcop_engine.TECHNIQUES)},
+        )
+
     print(f"\n[C2 CONTROLLER] Received web trigger for MITRE Technique: {technique_id}")
 
     try:

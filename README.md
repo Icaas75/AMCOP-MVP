@@ -194,12 +194,30 @@ Every cycle record now stores evaluation-integrity fields:
   detection failures.
 
 **`catch_rate`** (dashboard gauge) = RESILIENT cycles ÷ all cycles in the last
-50. Its denominator **includes execution failures and telemetry errors**, so
-it is a platform-outcome rate, not a detection rate.
+50 (`HISTORY_WINDOW`). Its denominator **includes execution failures and
+telemetry errors**, so it is a platform-outcome rate, not a detection rate.
 
 **`detection_rate`** (API `metrics.detection_rate` and `/assessment-report`)
 = TP ÷ (TP + FN) — the true-positive rate over cycles where the attack
 actually executed. `null` when no ground-truth-positive cycles exist.
+
+Both headline metrics use the **same window** (`HISTORY_WINDOW = 50` most
+recent cycles) in `/stream-telemetry` and `/assessment-report`, so the
+dashboard gauge and the report can never disagree on the denominator.
+Per-technique breakdowns in the report scan up to 500 records.
+
+**Technique IDs are validated at the API boundary**: `POST
+/execute-simulation/{id}` returns `422` for IDs not in the registry (the
+engine is not invoked). Historical records with unregistered IDs (e.g.
+`NOT-A-TECHNIQUE` from earlier sessions) are preserved but excluded from
+technique coverage and reported under `unrecognized_records`.
+
+**Detection evidence honesty**: in live operation every detected cycle fired
+from Rule C (the adversary's held-open `sshd … notty` session), not from the
+payload command itself — payload processes normally exit before the `ps aux`
+snapshot. Rule A (technique-specific recon signatures such as `cat /etc`,
+`netstat`, `uname`, `ip addr`) is implemented and unit-tested on fixtures,
+but per-technique rule attribution is **not claimed from live data**.
 
 ## Assessment report
 
@@ -215,7 +233,9 @@ techniques never attempted) and evaluation limitations.
 
 | Check | Result |
 |---|---|
-| `python -m unittest discover -s tests` | **43/43 pass** (incl. live integration) |
+| `python -m unittest discover -s tests` | **49/49 pass** (incl. live integration) |
+| Dashboard selector vs registry | **4/4 techniques selectable** (was 2; hardcoded list fixed) |
+| Invalid technique ID at API | **422 rejected**, engine not invoked |
 | Full cycle ×4 via API (T1087, T1049, T1082, T1016) | **4/4 `SUCCESS / DETECTED / RESILIENT`** |
 | New techniques T1082/T1016 | verified live with evidence + TP classification |
 | Repeatability (3 consecutive cycles, live test) | **3/3 DETECTED** |
@@ -236,7 +256,9 @@ techniques never attempted) and evaluation limitations.
    including historical pre-fix `VULNERABLE` and infrastructure-failure
    records; use `detection_rate` for the detection-pipeline view.
 4. **Four techniques implemented** (T1087, T1049, T1082, T1016); unknown IDs
-   fall back to `uname -a`. Payloads are read-only discovery.
+   are rejected at the API (`422`). Direct engine calls with unknown IDs fall
+   back to `uname -a` (kept for compatibility; the API never passes them).
+   Payloads are read-only discovery.
 5. **SSE loop runs per client forever** — fine for a demo, would need a
    connection manager for many concurrent viewers.
 6. **Dashboard loads React/Babel/Tailwind from CDN** at runtime; requires

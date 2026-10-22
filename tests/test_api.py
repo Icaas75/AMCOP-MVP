@@ -30,6 +30,19 @@ class TestDashboard(unittest.TestCase):
         self.assertIn("AMCOP", resp.text)
         self.assertIn("EventSource", resp.text)  # SSE client present
 
+    def test_dashboard_offers_every_registered_technique(self):
+        # Regression: the selector hardcoded only T1087/T1049 while the
+        # registry held four techniques.
+        client = TestClient(app_module.app)
+        resp = client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        for tech in amcop_engine.TECHNIQUES:
+            self.assertIn(f'value="{tech}"', resp.text,
+                          f"{tech} missing from dashboard selector")
+        # No phantom options for unregistered IDs.
+        self.assertEqual(resp.text.count("<option "),
+                         len(amcop_engine.TECHNIQUES))
+
 
 class TestExecuteSimulation(unittest.TestCase):
     def test_successful_cycle_returns_result_summary(self):
@@ -50,6 +63,45 @@ class TestExecuteSimulation(unittest.TestCase):
         self.assertEqual(body["result"]["blue_outcome"], "DETECTED")
         self.assertEqual(body["result"]["system_resilience"], "RESILIENT")
         mocked.assert_called_once_with("T1087")
+
+    def test_all_registered_techniques_accepted(self):
+        fake_report = {"red_outcome": "SUCCESS", "blue_outcome": "DETECTED",
+                       "system_resilience": "RESILIENT"}
+        client = TestClient(app_module.app)
+        for tech in sorted(amcop_engine.TECHNIQUES):
+            with mock.patch.object(amcop_engine, "trigger_manual_simulation",
+                                   return_value=fake_report) as mocked:
+                resp = client.post(f"/execute-simulation/{tech}")
+            self.assertEqual(resp.status_code, 200, tech)
+            self.assertEqual(resp.json()["technique"], tech)
+            mocked.assert_called_once_with(tech)
+
+    def test_unknown_technique_id_rejected_at_boundary(self):
+        # Regression: NOT-A-TECHNIQUE previously returned 200 and wrote a
+        # record with the uname fallback, inflating technique coverage.
+        client = TestClient(app_module.app)
+        with mock.patch.object(amcop_engine, "trigger_manual_simulation") as mocked:
+            resp = client.post("/execute-simulation/NOT-A-TECHNIQUE")
+        self.assertEqual(resp.status_code, 422)
+        body = resp.json()
+        self.assertEqual(body["status"], "ERROR")
+        self.assertIn("T1087", body["registered"])  # registry echoed
+        mocked.assert_not_called()  # engine never invoked
+
+    def test_injection_style_id_rejected(self):
+        # Slash-containing IDs never match the route (404, handler not
+        # reached); slash-free garbage hits the handler and is rejected (422).
+        # Either way the engine must not be invoked.
+        client = TestClient(app_module.app)
+        with mock.patch.object(amcop_engine, "trigger_manual_simulation") as mocked:
+            resp = client.post("/execute-simulation/T1;cat /etc/shadow")
+        self.assertIn(resp.status_code, (404, 422))
+        mocked.assert_not_called()
+
+        with mock.patch.object(amcop_engine, "trigger_manual_simulation") as mocked:
+            resp = client.post("/execute-simulation/T1;id%3Brm")
+        self.assertEqual(resp.status_code, 422)  # reaches handler, rejected
+        mocked.assert_not_called()
 
     def test_engine_exception_returns_clean_500(self):
         client = TestClient(app_module.app)
@@ -271,6 +323,99 @@ class TestAssessmentReport(unittest.TestCase):
         self.assertIn("T1082", gaps_text)
         self.assertIn("T1016", gaps_text)
         self.assertTrue(body["limitations"])
+
+    def test_headline_metrics_use_shared_sse_window(self):
+        # Regression: report previously computed metrics over up to 500
+        # records while the dashboard gauge used HISTORY_WINDOW (50), so the
+        # two could disagree (100% vs 90%). Headline metrics must now be
+        # computed over the same most-recent-HISTORY_WINDOW slice.
+        # 60 records: 60 RESILIENT would tie; use 55 resilient + 5 vulnerable
+        # so windowed (last 50 => all resilient => 100%) differs from full
+        # 60 (92%).
+        recent_50 = [{"mitre_technique": "T1087", "red_outcome": "SUCCESS",
+                      "blue_outcome": "DETECTED",
+                      "system_resilience": "RESILIENT"} for _ in range(55)]
+        older_5 = [{"mitre_technique": "T1087", "red_outcome": "SUCCESS",
+                    "blue_outcome": "MISSED",
+                    "system_resilience": "VULNERABLE"} for _ in range(5)]
+        # find().sort desc => list order newest-first
+        fake_logs = recent_50 + older_5
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs[:n]  # honor the window, like Mongo does
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            report = client.get("/assessment-report").json()
+            sse_data = app_module.fetch_operational_history_sync()
+
+        # Same definition, same window => identical headline numbers.
+        self.assertEqual(report["metrics"]["catch_rate"],
+                         sse_data["metrics"]["catch_rate"])
+        self.assertEqual(report["metrics"]["detection_rate"],
+                         sse_data["metrics"]["detection_rate"])
+        self.assertEqual(report["metrics"]["confusion"],
+                         sse_data["metrics"]["confusion"])
+        # Window actually applied: newest 50 are all resilient => 100% here,
+        # whereas the full 60-record history would be 92%.
+        self.assertEqual(report["metrics"]["catch_rate"], 100)
+        self.assertEqual(report["metrics"]["window"], app_module.HISTORY_WINDOW)
+        # Per-technique still scans the wider history (60 records).
+        self.assertEqual(report["generated_from_cycles"], 60)
+
+    def test_unrecognized_records_excluded_from_coverage(self):
+        # Regression: NOT-A-TECHNIQUE previously appeared as a first-class
+        # per_technique row (inflating coverage) and left no gap note.
+        fake_logs = [
+            {"mitre_technique": "NOT-A-TECHNIQUE", "red_outcome": "SUCCESS",
+             "blue_outcome": "DETECTED", "system_resilience": "RESILIENT"},
+            {"mitre_technique": "T1087", "technique_name": "Account Discovery",
+             "red_outcome": "SUCCESS", "blue_outcome": "DETECTED"},
+        ]
+
+        class FakeCursor:
+            def sort(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return fake_logs
+
+        class FakeCollection:
+            def find(self):
+                return FakeCursor()
+
+        class FakeDB:
+            def __getitem__(self, name):
+                return FakeCollection()
+
+        class FakeClient:
+            def __getitem__(self, name):
+                return FakeDB()
+
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "get_mongo_client", return_value=FakeClient()):
+            body = client.get("/assessment-report").json()
+
+        self.assertNotIn("NOT-A-TECHNIQUE", body["per_technique"])
+        self.assertEqual(body["unrecognized_records"], 1)
+        self.assertEqual(body["per_technique"]["T1087"]["attempted"], 1)
+        self.assertTrue(any("unregistered" in g for g in body["gaps"]))
 
     def test_report_with_empty_db(self):
         class FakeCursor:
