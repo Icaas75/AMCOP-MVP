@@ -1,9 +1,12 @@
 import asyncio
+import hmac
 import json
 import re
+import threading
+import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
@@ -213,12 +216,81 @@ _ANALYST_HTTP = {
     analyst_service.INVALID_OUTPUT: 502,
 }
 
+# --- Analyze-endpoint hardening ---------------------------------------------
+# In-memory, per-client sliding-window limiter. Process-local by design: this
+# app is deployed as a single uvicorn process for the isolated lab; a shared
+# store would be required for multi-worker/multi-host deployments.
+_ANALYST_RATE_LOCK = threading.Lock()
+_ANALYST_RATE_BUCKETS = {}
+_ANALYST_RATE_MAX_KEYS = 1024
+
+
+def _reset_analyst_rate_limit():
+    """Clear limiter state (used by tests; harmless in production)."""
+    with _ANALYST_RATE_LOCK:
+        _ANALYST_RATE_BUCKETS.clear()
+
+
+def _analyst_retry_after(client_key):
+    """None if allowed, else the seconds the client should wait.
+
+    Counts timestamps inside the configured window. Rejecting before any DB or
+    provider work keeps abusive callers from spending money or quota.
+    """
+    limit = config.ANALYST_RATE_LIMIT
+    window = config.ANALYST_RATE_WINDOW_S
+    if limit <= 0 or window <= 0:
+        return None
+    now = time.monotonic()
+    cutoff = now - window
+    with _ANALYST_RATE_LOCK:
+        if len(_ANALYST_RATE_BUCKETS) > _ANALYST_RATE_MAX_KEYS:
+            # Bound memory: drop clients whose window has fully aged out.
+            for key in [k for k, v in _ANALYST_RATE_BUCKETS.items()
+                        if not v or v[-1] <= cutoff]:
+                _ANALYST_RATE_BUCKETS.pop(key, None)
+        bucket = _ANALYST_RATE_BUCKETS.setdefault(client_key, [])
+        bucket[:] = [t for t in bucket if t > cutoff]
+        if len(bucket) >= limit:
+            return max(1, int(bucket[0] + window - now) + 1)
+        bucket.append(now)
+    return None
+
+
+def _analyst_token_ok(request):
+    """Optional access token; constant-time compare to avoid timing leaks."""
+    expected = config.ANALYST_API_TOKEN
+    if not expected:
+        return True
+    provided = request.headers.get("x-api-token", "")
+    return hmac.compare_digest(provided, expected)
+
 
 @app.post("/analyze-operation/{operation_id}")
-async def analyze_operation(operation_id: str):
+async def analyze_operation(operation_id: str, request: Request):
     """AI-Assisted Incident Analyst: evidence-grounded explanation of ONE
     completed operation. Read-only: never writes records or touches verdicts
-    or metrics."""
+    or metrics. Rate limited per client; optionally requires X-API-Token."""
+    client_key = request.client.host if request.client else "unknown"
+    retry_after = _analyst_retry_after(client_key)
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            content={"status": "ERROR",
+                     "detail": "Too many analysis requests; retry later."},
+        )
+
+    # Gate before the DB/model: an unauthenticated caller learns nothing and
+    # cannot spend provider quota.
+    if not _analyst_token_ok(request):
+        return JSONResponse(
+            status_code=401,
+            content={"status": "ERROR",
+                     "detail": "Authentication required: send the configured "
+                               "X-API-Token header."},
+        )
+
     # Validate identifier at the API boundary (same convention as techniques).
     if not _OBJECTID_RE.match(operation_id):
         return JSONResponse(

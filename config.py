@@ -77,6 +77,16 @@ LLM_BASE_URL = env("AMCOP_LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_TIMEOUT_S = int(env("AMCOP_LLM_TIMEOUT_S", "30"))
 LLM_MAX_TOKENS = int(env("AMCOP_LLM_MAX_TOKENS", "700"))
 
+# --- Analyze-endpoint hardening (optional) -----------------------------------
+# An optional access token: when set, POST /analyze-operation/{id} requires an
+# X-API-Token header. Empty (default) keeps the loopback dashboard working as
+# before. This is NOT the provider key; it gates who may spend model calls.
+ANALYST_API_TOKEN = env("AMCOP_ANALYST_API_TOKEN", "")
+# Per-client in-memory rate limit (requests per window, seconds). 0 disables.
+# Single-process only; resets on restart.
+ANALYST_RATE_LIMIT = int(env("AMCOP_ANALYST_RATE_LIMIT", "30"))
+ANALYST_RATE_WINDOW_S = int(env("AMCOP_ANALYST_RATE_WINDOW_S", "60"))
+
 
 def llm_available():
     """The analyst feature requires an explicit credential."""

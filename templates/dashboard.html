@@ -95,11 +95,18 @@
             setAnalysis(null);
             setAnalysisDetail("");
             try {
-                const resp = await fetch(`/analyze-operation/${activeLog._id}`, { method: 'POST' });
+                // Optional endpoint token (only when the operator configured
+                // AMCOP_ANALYST_API_TOKEN). Never embedded in the page source.
+                const analystToken = window.localStorage.getItem('amcop_analyst_token') || '';
+                const headers = analystToken ? { 'X-API-Token': analystToken } : {};
+                const resp = await fetch(`/analyze-operation/${activeLog._id}`, { method: 'POST', headers });
                 const body = await resp.json().catch(() => ({}));
                 if (resp.status === 200 && body.status === "OK") {
                     setAnalysis(body.analysis);
                     setAnalysisState("success");
+                } else if (resp.status === 401) {
+                    setAnalysisDetail("Authentication required: set localStorage 'amcop_analyst_token' to the configured AMCOP_ANALYST_API_TOKEN.");
+                    setAnalysisState("failure");
                 } else if (resp.status === 503) {
                     setAnalysisDetail(body.detail || "AI analysis is not configured.");
                     setAnalysisState("unavailable");

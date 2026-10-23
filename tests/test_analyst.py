@@ -305,5 +305,77 @@ class TestSessionBasedGuard(unittest.TestCase):
         self.assertEqual(normalized["detection_basis"], "insufficient_evidence")
 
 
+class TestAnalystAuth(unittest.TestCase):
+    """Optional X-API-Token gate; disabled by default."""
+
+    def setUp(self):
+        app_module._reset_analyst_rate_limit()
+
+    def test_token_required_when_configured(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "ANALYST_API_TOKEN", "s3cret"), \
+                _with_db(_record()), _mock_model() as model:
+            resp = client.post(f"/analyze-operation/{OP_ID}")
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["status"], "ERROR")
+        model.assert_not_called()
+
+    def test_wrong_token_rejected(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "ANALYST_API_TOKEN", "s3cret"), \
+                _with_db(_record()), _mock_model() as model:
+            resp = client.post(f"/analyze-operation/{OP_ID}",
+                               headers={"X-API-Token": "wrong"})
+        self.assertEqual(resp.status_code, 401)
+        model.assert_not_called()
+
+    def test_correct_token_accepted(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "ANALYST_API_TOKEN", "s3cret"), \
+                _with_credentials(), _with_db(_record()), _mock_model():
+            resp = client.post(f"/analyze-operation/{OP_ID}",
+                               headers={"X-API-Token": "s3cret"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_empty_token_keeps_endpoint_open(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "ANALYST_API_TOKEN", ""), \
+                _with_credentials(), _with_db(_record()), _mock_model():
+            resp = client.post(f"/analyze-operation/{OP_ID}")
+        self.assertEqual(resp.status_code, 200)
+
+
+class TestAnalystRateLimit(unittest.TestCase):
+    """Per-client limiter protects the paid provider call."""
+
+    def setUp(self):
+        app_module._reset_analyst_rate_limit()
+
+    def tearDown(self):
+        app_module._reset_analyst_rate_limit()
+
+    def test_exceeding_limit_returns_429(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "ANALYST_RATE_LIMIT", 2), \
+                mock.patch.object(config, "ANALYST_RATE_WINDOW_S", 60), \
+                _with_credentials(), _with_db(_record()), _mock_model():
+            first = client.post(f"/analyze-operation/{OP_ID}")
+            second = client.post(f"/analyze-operation/{OP_ID}")
+            third = client.post(f"/analyze-operation/{OP_ID}")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(third.status_code, 429)
+        self.assertEqual(third.json()["status"], "ERROR")
+        self.assertIn("Retry-After", third.headers)
+
+    def test_limit_zero_disables_limiter(self):
+        client = TestClient(app_module.app)
+        with mock.patch.object(config, "ANALYST_RATE_LIMIT", 0), \
+                _with_credentials(), _with_db(_record()), _mock_model():
+            codes = [client.post(f"/analyze-operation/{OP_ID}").status_code
+                     for _ in range(5)]
+        self.assertEqual(codes, [200] * 5)
+
+
 if __name__ == "__main__":
     unittest.main()
